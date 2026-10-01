@@ -13,6 +13,7 @@ import math
 import os
 import re
 import time
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -266,6 +267,89 @@ class OpenAIGenerator:
         return answer
 
 
+class LocalGenerator:
+    """OpenAI-compatible local API (Antigravity, Ollama, vLLM, etc.)."""
+
+    def __init__(self, max_tokens: int = 512) -> None:
+        self.base_url = os.getenv("LOCAL_API_URL", "").strip()
+        self.api_key  = os.getenv("LOCAL_API_KEY", "local").strip()
+        self.model    = os.getenv("LOCAL_MODEL", "").strip()
+        if not self.base_url:
+            raise RuntimeError("LOCAL_API_URL is missing from .env")
+        if not self.model:
+            raise RuntimeError("LOCAL_MODEL is missing from .env")
+        self.client     = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.max_tokens = max_tokens
+
+    def generate(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=self.max_tokens,
+        )
+        answer = response.choices[0].message.content or ""
+        answer = answer.strip()
+        if not answer:
+            raise RuntimeError("Local model returned an empty answer")
+        return answer
+
+
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 1000) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        self.api_key = api_key
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": self.max_output_tokens,
+                "temperature": 0.0,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        last_exc: Exception | None = None
+        for attempt in range(6):
+            if attempt > 0:
+                is_rate = "429" in str(last_exc)
+                wait = (60 * attempt) if is_rate else (2 ** attempt)
+                wait = min(wait, 300)
+                time.sleep(wait)
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=45.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise RuntimeError(f"Gemini API request failed: {last_exc}") from last_exc
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "".join(part.get("text", "") for part in parts).strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -296,10 +380,17 @@ class DomainAssistant:
         top_k: int = 5,
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
+        if generator is None:
+            if os.getenv("LOCAL_API_URL", "").strip():
+                generator = LocalGenerator()
+            elif os.getenv("GEMINI_API_KEY", "").strip():
+                generator = GeminiGenerator()
+            else:
+                generator = OpenAIGenerator()
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator,
             top_k,
         )
 
@@ -451,6 +542,8 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        if index < total:
+            time.sleep(12)
 
     return {
         "schema_version": "1.0",
